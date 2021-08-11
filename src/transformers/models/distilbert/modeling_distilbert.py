@@ -19,7 +19,6 @@
 
 
 import math
-
 import numpy as np
 import torch
 from torch import nn
@@ -122,6 +121,34 @@ class Embeddings(nn.Module):
         embeddings = self.dropout(embeddings)  # (bs, max_seq_length, dim)
         return embeddings
 
+############################ Cell embedding - removing position
+
+class CellEmbeddings(Embeddings):
+    def __init__(self, config):
+        super().__init__(config)
+        self.position_embedding_type = None
+
+    def forward(self, input_ids):
+        """
+        Parameters:
+            input_ids: torch.tensor(bs, max_seq_length) The token ids to embed.
+
+        Returns: torch.tensor(bs, max_seq_length, dim) The embedded tokens (plus position embeddings, no token_type
+        embeddings)
+        """
+        seq_length = input_ids.size(1)
+        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)  # (max_seq_length)
+        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)  # (bs, max_seq_length)
+
+        word_embeddings = self.word_embeddings(input_ids)  # (bs, max_seq_length, dim)
+        position_embeddings = self.position_embeddings(position_ids)  # (bs, max_seq_length, dim)
+
+        embeddings = word_embeddings + position_embeddings  # (bs, max_seq_length, dim)
+        embeddings = self.LayerNorm(embeddings)  # (bs, max_seq_length, dim)
+        embeddings = self.dropout(embeddings)  # (bs, max_seq_length, dim)
+        return embeddings
+
+############################# End.1
 
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, config):
@@ -209,6 +236,69 @@ class MultiHeadSelfAttention(nn.Module):
         else:
             return (context,)
 
+##################### 
+
+class CellSelfAttention(MultiHeadSelfAttention):
+    def __init__(self, config):
+        super().__init__(config)
+        self.position_embedding_type = None
+
+
+    def forward(self, query, key, value, mask, head_mask=None, output_attentions=False):
+        """
+        Parameters:
+            query: torch.tensor(bs, seq_length, dim)
+            key: torch.tensor(bs, seq_length, dim)
+            value: torch.tensor(bs, seq_length, dim)
+            mask: torch.tensor(bs, seq_length)
+
+        Returns:
+            weights: torch.tensor(bs, n_heads, seq_length, seq_length) Attention weights context: torch.tensor(bs,
+            seq_length, dim) Contextualized layer. Optional: only if `output_attentions=True`
+        """
+        bs, q_length, dim = query.size()
+        k_length = key.size(1)
+        # assert dim == self.dim, f'Dimensions do not match: {dim} input vs {self.dim} configured'
+        # assert key.size() == value.size()
+
+        dim_per_head = self.dim // self.n_heads
+
+        mask_reshp = (bs, 1, 1, k_length)
+
+        def shape(x):
+            """separate heads"""
+            return x.view(bs, -1, self.n_heads, dim_per_head).transpose(1, 2)
+
+        def unshape(x):
+            """group heads"""
+            return x.transpose(1, 2).contiguous().view(bs, -1, self.n_heads * dim_per_head)
+
+        q = shape(self.q_lin(query))  # (bs, n_heads, q_length, dim_per_head)
+        k = shape(self.k_lin(key))  # (bs, n_heads, k_length, dim_per_head)
+        v = shape(self.v_lin(value))  # (bs, n_heads, k_length, dim_per_head)
+
+        q = q / math.sqrt(dim_per_head)  # (bs, n_heads, q_length, dim_per_head)
+        scores = torch.matmul(q, k.transpose(2, 3))  # (bs, n_heads, q_length, k_length)
+        mask = (mask == 0).view(mask_reshp).expand_as(scores)  # (bs, n_heads, q_length, k_length)
+        scores.masked_fill_(mask, -float("inf"))  # (bs, n_heads, q_length, k_length)
+
+        weights = nn.Softmax(dim=-1)(scores)  # (bs, n_heads, q_length, k_length)
+        weights = self.dropout(weights)  # (bs, n_heads, q_length, k_length)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            weights = weights * head_mask
+
+        context = torch.matmul(weights, v)  # (bs, n_heads, q_length, dim_per_head)
+        context = unshape(context)  # (bs, q_length, dim)
+        context = self.out_lin(context)  # (bs, q_length, dim)
+
+        if output_attentions:
+            return (context, weights)
+        else:
+            return (context,)
+
+################################ end.2
 
 class FFN(nn.Module):
     def __init__(self, config):
@@ -238,7 +328,7 @@ class TransformerBlock(nn.Module):
 
         assert config.dim % config.n_heads == 0
 
-        self.attention = MultiHeadSelfAttention(config)
+        self.attention = CellSelfAttention(config) ############ Cell
         self.sa_layer_norm = nn.LayerNorm(normalized_shape=config.dim, eps=1e-12)
 
         self.ffn = FFN(config)
@@ -425,7 +515,7 @@ class DistilBertModel(DistilBertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
-        self.embeddings = Embeddings(config)  # Embeddings
+        self.embeddings = CellEmbeddings(config)  ############################### CellEmbeddings
         self.transformer = Transformer(config)  # Encoder
 
         self.init_weights()
